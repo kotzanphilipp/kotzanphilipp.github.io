@@ -7,7 +7,8 @@ and compares it against the last stored snapshot.
 Exit codes:
     0  no change
     1  content changed (unified diff on stdout)
-    2  fetch or parse failure (message on stderr)
+    2  transient failure - network error or bot challenge (message on stderr)
+    3  parse failure - the page loaded but no longer has the expected markers
 
 Use --init to write the first snapshot without reporting a change.
 """
@@ -17,6 +18,7 @@ import html
 import os
 import re
 import sys
+import time
 import urllib.request
 
 URL = "https://nextmove.de/ueberfuehrungsfahrten/"
@@ -30,16 +32,58 @@ END_MARKER = "Die allgemeinen Test Drives im Detail"
 USER_AGENT = ("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
               "(KHTML, like Gecko) Chrome/124.0 Safari/537.36")
 
+# The site sits behind a WAF that intermittently serves an interstitial instead
+# of the page. Those responses are short and carry one of these phrases; they
+# are a transient block, not a layout change.
+CHALLENGE_PHRASES = (
+    "your request is being verified",
+    "one moment, please",
+    "just a moment",
+    "enable javascript and cookies to continue",
+    "checking your browser",
+)
+# A real page run is ~97 KB; the interstitial is ~12 KB.
+MIN_PAGE_BYTES = 40000
 
-def fetch(url):
+ATTEMPTS = 3
+BACKOFF_SECONDS = 20
+
+
+class Blocked(Exception):
+    """The WAF served a challenge page instead of the content."""
+
+
+def fetch_once(url):
     req = urllib.request.Request(url, headers={
         "User-Agent": USER_AGENT,
-        "Accept-Language": "de-DE,de;q=0.9",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "de-DE,de;q=0.9,en;q=0.8",
     })
     with urllib.request.urlopen(req, timeout=60) as resp:
         raw = resp.read()
-    return raw.decode(resp.headers.get_content_charset() or "utf-8",
-                      errors="replace")
+    markup = raw.decode(resp.headers.get_content_charset() or "utf-8",
+                        errors="replace")
+
+    lowered = markup.lower()
+    if any(phrase in lowered for phrase in CHALLENGE_PHRASES):
+        raise Blocked("WAF interstitial served (%d bytes)" % len(raw))
+    if len(raw) < MIN_PAGE_BYTES:
+        raise Blocked("response too short to be the real page (%d bytes)"
+                      % len(raw))
+    return markup
+
+
+def fetch(url):
+    """Fetches with retries; raises the last error if every attempt fails."""
+    last = None
+    for attempt in range(ATTEMPTS):
+        try:
+            return fetch_once(url)
+        except Exception as exc:  # noqa: BLE001 - retry on anything
+            last = exc
+            if attempt < ATTEMPTS - 1:
+                time.sleep(BACKOFF_SECONDS * (attempt + 1))
+    raise last
 
 
 def visible_text(markup):
@@ -69,15 +113,20 @@ def main():
 
     try:
         markup = fetch(URL)
+    except Blocked as exc:
+        print("BLOCKED: %s - transient, will retry next run" % exc,
+              file=sys.stderr)
+        return 2
     except Exception as exc:  # noqa: BLE001 - any failure is a fetch failure
         print("FETCH FAILED: %s" % exc, file=sys.stderr)
         return 2
 
     section = extract_offers(visible_text(markup))
     if section is None:
-        print("PARSE FAILED: offer section markers not found - page layout "
-              "may have changed", file=sys.stderr)
-        return 2
+        print("PARSE FAILED: page loaded but the offer section markers are "
+              "gone - layout has changed, monitor needs updating",
+              file=sys.stderr)
+        return 3
 
     current = "\n".join(section) + "\n"
 
